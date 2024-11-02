@@ -40,7 +40,7 @@ Sat Nov 2 2024 2:36:37 PM [INFO    ]: Committing staged Foo instances.
 Sat Nov 2 2024 2:36:37 PM [INFO    ]: Created     37 Foo instances.
 ```
 
-## Existing
+## Access Existing Instances
 Another key feature of stagers is that they keep track of existing model instances in the database using the `existing` attribute. This way, it is easy to check whether a new object is already tracked in the django database or has already been staged previously. 
 
 ```python
