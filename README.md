@@ -3,9 +3,7 @@
 </p>
 
 # Django Stagers
-This package provides a class `Stager` to stage objects for bulk creation, update, or deletion at a later time.
-
-The `Stager` simplifies bulk operations on database objects, allowing you to easily track these database operations and commit them all at once at a later time. That way, you can focus on the sync logic without tracking model instances or their unique identifiers.
+This package provides a class `Stager` to stage model instances for bulk creation, update, or deletion at a later time. That way, you can focus on writing sync logic without worrying about keeping track of model instances or their unique identifiers.
 
 # Installation
 
