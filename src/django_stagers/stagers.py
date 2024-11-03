@@ -45,37 +45,50 @@ class Stager(Generic[M]):
             for existing_key, existing_model in self.existing.items():
                 self.existing_related[key][existing_key] = getattr(existing_model, key).all()
 
-    def create(self, instance: M, key: str | None = None):
-        key = key or str(getattr(instance, self.key))
-        self.to_create[key] = instance
-        if not key in self.existing:
-            self.existing[key] = instance
+    def create(self, qs_or_instance: QuerySet[M] | M):
+        if isinstance(qs_or_instance, QuerySet):
+            for instance in qs_or_instance:
+                self.create(instance)
         else:
-            raise Exception(f"Tried to create a duplicate model with key = {key}")
+            key = str(getattr(qs_or_instance, self.key))
+            self.to_create[key] = qs_or_instance
+            if not key in self.existing:
+                self.existing[key] = qs_or_instance
+            else:
+                raise Exception(f"Tried to create a duplicate model with key = {key}")
 
-    def update(self, key: str, field: str, value: Any):
+    def update(self, qs_or_instance: QuerySet[M] | M, field: str, value: Any):
+        if isinstance(qs_or_instance, QuerySet):
+            for instance in qs_or_instance:
+                self.update(instance, field, value)
+        else:
+            key = str(getattr(qs_or_instance, self.key))
 
-        if key in self.to_create:
-            to_create = self.to_create[key]
-            if getattr(to_create, field) != value:
-                setattr(to_create, field, value)
+            if key in self.to_create:
+                to_create = self.to_create[key]
+                if getattr(to_create, field) != value:
+                    setattr(to_create, field, value)
 
-        if key in self.existing:
-            existing = self.existing[key]
-            if getattr(existing, field) != value:
-                setattr(existing, field, value)
-                self.to_update_fields.add(field)
-                self.to_update[key] = existing
+            if key in self.existing:
+                existing = self.existing[key]
+                if getattr(existing, field) != value:
+                    setattr(existing, field, value)
+                    self.to_update_fields.add(field)
+                    self.to_update[key] = existing
 
-    def delete(self, instance: M):
-        self.to_delete.add(str(instance.pk))
+    def delete(self, qs_or_instance: QuerySet[M] | M):
+        if isinstance(qs_or_instance, QuerySet):
+            for instance in qs_or_instance:
+                self.delete(instance)
+        else:
+            self.to_delete.add(str(qs_or_instance.pk))
 
     def add_seen(self, key: str):
         self.seen.add(key)
 
-    def delete_unseen(self):
-        unseen = {str(model.pk) for key, model in self.existing.items() if key not in self.seen}
-        self.to_delete |= unseen
+    @property
+    def unseen_instances(self):
+        return list({str(model.pk) for key, model in self.existing.items() if key not in self.seen})
 
     def commit(self):
 

@@ -1,0 +1,4 @@
+-r requirements.in
+
+django-stubs
+ipython
