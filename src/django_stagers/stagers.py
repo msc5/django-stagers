@@ -9,6 +9,7 @@ M = TypeVar('M', bound=Model)
 
 
 class Stager(Generic[M]):
+    model: type[M]
 
     existing: dict[str, M]
     seen: set[str]
@@ -30,7 +31,9 @@ class Stager(Generic[M]):
     ) -> None:
 
         self.queryset = queryset
+        assert self.queryset.model
         self.model = self.queryset.model
+
         self.key = key
         self.seen = set()
         self.to_create = {}
@@ -108,19 +111,20 @@ class Stager(Generic[M]):
         return [model for key, model in self.existing.items() if key not in self.seen]
 
     def commit(self) -> None:
+        model_name = str(self.model.__name__)
 
         # Determine type of provided type argument `M`
-        logging.info(f'Committing staged {self.model.__name__} instances.')
+        logging.info(f'Committing staged {model_name} instances.')
 
         if self.to_create:
             self.model.objects.bulk_create(list(self.to_create.values()))
-            logging.info(f'Created {len(self.to_create):6,} {self.model.__name__} instances.')
+            logging.info(f'Created {len(self.to_create):6,} {model_name} instances.')
 
         if self.to_update:
             self.model.objects.bulk_update(list(self.to_update.values()), fields=list(self.to_update_fields))
-            logging.info(f'Updated {len(self.to_update):6,} {self.model.__name__} instances.')
+            logging.info(f'Updated {len(self.to_update):6,} {model_name} instances.')
             logging.info(f'Updated Fields: {self.to_update_fields}')
 
         if self.to_delete:
             self.model.objects.filter(id__in=self.to_delete).delete()
-            logging.info(f'Deleted {len(self.to_delete):6,} {self.model.__name__} instances.')
+            logging.info(f'Deleted {len(self.to_delete):6,} {model_name} instances.')
