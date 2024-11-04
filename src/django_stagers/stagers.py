@@ -116,10 +116,10 @@ class Stager(Generic[M]):
     def commit(self) -> None:
         model_name = str(self.model.__name__)
 
-        # Determine type of provided type argument `M`
-        logging.info(f'Committing staged {model_name} instances.')
-
         with transaction.atomic():
+
+            if any([self.to_create, self.to_delete, self.to_update]):
+                logging.info(f'Committing staged {model_name} instances.')
 
             if self.to_create:
                 self.model.objects.bulk_create(list(self.to_create.values()))
