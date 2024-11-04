@@ -15,24 +15,33 @@ decorator==5.1.1
 django==5.1.2
     # via
     #   -r /Users/msc/Code/django-stagers/requirements.in
+    #   django-extensions
     #   django-stubs
     #   django-stubs-ext
+django-extensions==3.2.3
+    # via -r requirements-dev.in
 django-stubs==5.1.1
     # via -r requirements-dev.in
 django-stubs-ext==5.1.1
     # via django-stubs
 executing==2.1.0
     # via stack-data
+iniconfig==2.0.0
+    # via pytest
 ipython==8.29.0
     # via -r requirements-dev.in
 jedi==0.19.1
     # via ipython
 matplotlib-inline==0.1.7
     # via ipython
+packaging==24.1
+    # via pytest
 parso==0.8.4
     # via jedi
 pexpect==4.9.0
     # via ipython
+pluggy==1.5.0
+    # via pytest
 prompt-toolkit==3.0.48
     # via ipython
 ptyprocess==0.7.0
@@ -41,6 +50,8 @@ pure-eval==0.2.3
     # via stack-data
 pygments==2.18.0
     # via ipython
+pytest==8.3.3
+    # via -r requirements-dev.in
 six==1.16.0
     # via asttokens
 sqlparse==0.5.1
