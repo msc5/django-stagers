@@ -52,8 +52,6 @@ pygments==2.18.0
     # via ipython
 pytest==8.3.3
     # via -r requirements-dev.in
-pytz==2024.2
-    # via -r requirements-dev.in
 six==1.16.0
     # via asttokens
 sqlparse==0.5.1
