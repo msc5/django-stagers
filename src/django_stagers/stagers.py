@@ -3,6 +3,7 @@ import logging
 from typing import Any, Generic, TypeVar
 
 from django.db.models import Model, QuerySet
+from django.db import transaction
 
 
 M = TypeVar('M', bound=Model)
@@ -33,20 +34,26 @@ class Stager(Generic[M]):
         self.queryset = queryset
         assert self.queryset.model
         self.model = self.queryset.model
-
         self.key = key
-        self.seen = set()
+        self.load_related = load_related
+
+        self.existing = {getattr(m, self.key): m for m in self.queryset}
+        self.existing_related = defaultdict(dict)
+        for key in self.load_related:
+            for existing_key, existing_model in self.existing.items():
+                self.existing_related[key][existing_key] = getattr(existing_model, key).all()
+
+        self.reset()
+
+    def reset(self):
         self.to_create = {}
         self.to_update = {}
         self.to_delete = set()
         self.to_update_fields = set()
+        self.reset_seen()
 
-        self.existing = {getattr(m, key): m for m in self.queryset}
-
-        self.existing_related = defaultdict(dict)
-        for key in load_related:
-            for existing_key, existing_model in self.existing.items():
-                self.existing_related[key][existing_key] = getattr(existing_model, key).all()
+    def reset_seen(self):
+        self.seen = set()
 
     def create(self, qs_or_instance: QuerySet[M] | M) -> None:
         if isinstance(qs_or_instance, QuerySet):
@@ -108,7 +115,10 @@ class Stager(Generic[M]):
 
     @property
     def unseen_instances(self) -> list[M]:
-        return [model for key, model in self.existing.items() if key not in self.seen]
+        return [
+            model for key, model in self.existing.items()
+            if key not in self.seen
+        ]
 
     def commit(self) -> None:
         model_name = str(self.model.__name__)
@@ -116,15 +126,19 @@ class Stager(Generic[M]):
         # Determine type of provided type argument `M`
         logging.info(f'Committing staged {model_name} instances.')
 
-        if self.to_create:
-            self.model.objects.bulk_create(list(self.to_create.values()))
-            logging.info(f'Created {len(self.to_create):6,} {model_name} instances.')
+        with transaction.atomic():
 
-        if self.to_update:
-            self.model.objects.bulk_update(list(self.to_update.values()), fields=list(self.to_update_fields))
-            logging.info(f'Updated {len(self.to_update):6,} {model_name} instances.')
-            logging.info(f'Updated Fields: {self.to_update_fields}')
+            if self.to_create:
+                self.model.objects.bulk_create(list(self.to_create.values()))
+                logging.info(f'Created {len(self.to_create):6,} {model_name} instances.')
 
-        if self.to_delete:
-            self.model.objects.filter(id__in=self.to_delete).delete()
-            logging.info(f'Deleted {len(self.to_delete):6,} {model_name} instances.')
+            if self.to_update:
+                self.model.objects.bulk_update(list(self.to_update.values()), fields=list(self.to_update_fields))
+                logging.info(f'Updated {len(self.to_update):6,} {model_name} instances.')
+                logging.info(f'Updated Fields: {self.to_update_fields}')
+
+            if self.to_delete:
+                self.model.objects.filter(id__in=self.to_delete).delete()
+                logging.info(f'Deleted {len(self.to_delete):6,} {model_name} instances.')
+
+            self.reset()

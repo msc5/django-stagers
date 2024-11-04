@@ -1,4 +1,8 @@
 -r requirements.in
 
+pytest
+
 django-stubs
+django_extensions
+
 ipython

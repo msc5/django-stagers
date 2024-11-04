@@ -19,3 +19,7 @@ requires = [
     "django>=4.0.0"
 ]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+python_files = ["tests.py"]
