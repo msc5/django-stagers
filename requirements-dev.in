@@ -1,5 +1,6 @@
 -r requirements.in
 
+pytz
 pytest
 
 django-stubs
