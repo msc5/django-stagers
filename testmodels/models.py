@@ -15,6 +15,9 @@ class DataModel(models.Model):
 
 
 class Foo(DataModel):
+    normal_bars = models.ManyToManyField("Bar", related_name="normal_foos")
+    special_bars = models.ManyToManyField("Bar", related_name="special_foos", through="SpecialFooBar")
+
     datetime_action = models.DateTimeField()
     datetime_created = models.DateTimeField(default=timezone.now)
 
@@ -24,3 +27,8 @@ class Bar(DataModel):
 
     datetime_action = models.DateTimeField()
     datetime_created = models.DateTimeField(default=timezone.now)
+
+
+class SpecialFooBar(models.Model):
+    foo = models.ForeignKey("Foo", related_name="special_foo_bars", on_delete=models.PROTECT)
+    bar = models.ForeignKey("Bar", related_name="special_foo_bars", on_delete=models.PROTECT)

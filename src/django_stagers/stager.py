@@ -2,12 +2,12 @@ from collections import defaultdict
 import logging
 from typing import Any, Generic, TypeVar
 
+from django.db import models
 from django.db.models import Model, QuerySet
 from django.db import transaction
 
 
 M = TypeVar('M', bound=Model)
-
 
 
 class Stager(Generic[M]):
@@ -145,21 +145,45 @@ class Stager(Generic[M]):
         ]
 
 
-class SuperStager:
-    stagers: dict[str, Stager] 
-    stagers_mtm: dict[str, Stager]
+class MTMStager(Stager):
 
-    def __init__(self, *args, **kwargs):
+    # def __init__(self, *args, **kwargs) -> None:
+    #     super().__init__(*args, **kwargs)
+
+    def add(self): 
         pass
 
+
+class SuperStager:
+    stagers: dict[str, Stager[Model]] 
+    stagers_mtm: dict[str, dict[str, Stager[Model]]]
+
+    def __init__(self, *args, **kwargs):
         self.stagers = {}
-        for attr in dir(self) if (
-            not attr.startswith('__') 
-            and not callable(stager := getattr(self, attr))
-        ):
-            self.stagers[attr] = stager
+        self.stagers_mtm = defaultdict(dict)
 
-            for field in stager.mode
+        # Collect all Stagers defined on subclass
+        for key in dir(self):
+            if isinstance(stager := getattr(self, key), Stager):
+                self.stagers[key] = stager
 
+                # Collect all ManyToMany through-tables
+                stager_model = self.stagers[key].model
+                for field in stager_model._meta.get_fields():
+                    
+                    if isinstance(field, models.ManyToManyField):
+                        through = field.remote_field.through
+                        if through:
+                            stager_mtm = Stager(queryset=through.objects.all())
 
-    def link_mtm(self, from_qs_or_instance: QuerySet | Model, to_qs_or_instance: QuerySet | Model):
+                            # Create dictionaries to access correct stager for
+                            # ManyToMany field
+                            for model in [field.model, field.remote_field.model]:
+                                for name in [field.name, field.remote_field.name]:
+                                    self.stagers_mtm[model.__name__][name] = stager_mtm
+
+    def create_mtm_many(self, from_qs_or_instance: QuerySet | Model, to_qs_or_instance: QuerySet | Model, field: str):
+        pass
+
+    def create_mtm(self, from_instance: Model, to_instance: Model, field: str):
+        stager = self.stagers_mtm[from_instance._meta.model.__name__][field]

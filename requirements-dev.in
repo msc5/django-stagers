@@ -6,3 +6,5 @@ django-stubs
 django_extensions
 
 ipython
+ipdb
+rich
