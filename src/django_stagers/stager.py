@@ -9,6 +9,7 @@ from django.db import transaction
 M = TypeVar('M', bound=Model)
 
 
+
 class Stager(Generic[M]):
     model: type[M]
 
@@ -142,3 +143,23 @@ class Stager(Generic[M]):
             model for key, model in self.existing.items()
             if key not in self.seen
         ]
+
+
+class SuperStager:
+    stagers: dict[str, Stager] 
+    stagers_mtm: dict[str, Stager]
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+        self.stagers = {}
+        for attr in dir(self) if (
+            not attr.startswith('__') 
+            and not callable(stager := getattr(self, attr))
+        ):
+            self.stagers[attr] = stager
+
+            for field in stager.mode
+
+
+    def link_mtm(self, from_qs_or_instance: QuerySet | Model, to_qs_or_instance: QuerySet | Model):
