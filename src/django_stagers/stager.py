@@ -30,12 +30,16 @@ class Stager(Generic[M]):
 
     def __init__(
         self,
-        queryset: QuerySet[M],
+        queryset: QuerySet[M] | Callable[[], QuerySet[M]],
         key: str = 'pk',
         load_related: list[str] = []
     ) -> None:
 
-        self.queryset = queryset
+        if isinstance(queryset, QuerySet):
+            self.queryset = queryset
+        else:
+            self.queryset = queryset()
+
         assert self.queryset.model
         self.model = self.queryset.model
         self.key = key
@@ -49,12 +53,17 @@ class Stager(Generic[M]):
 
         self.reset()
 
-    def reset(self):
-        self.to_create = {}
+    def reset(self, exclude: set[str] = set()):
+        self.to_create = {
+            key: val
+            for key, val in getattr(self, "to_create", {}).items()
+            if key in exclude
+        } 
+        self.depends_on = getattr(self, "depends_on", defaultdict(set))
+
         self.to_update = {}
-        self.to_delete = set()
         self.to_update_fields = set()
-        self.depends_on = defaultdict(set)
+        self.to_delete = set()
         self.reset_seen()
 
     def reset_seen(self):
@@ -64,7 +73,7 @@ class Stager(Generic[M]):
         key = str(getattr(instance, self.key, ""))
         for field in instance._meta.get_fields():
             if isinstance(field, models.ForeignKey):
-                self.depends_on[key].add(getattr(instance, field.name).pk)
+                self.depends_on[key].add(str(getattr(instance, field.name).pk))
 
     def create(self, qs_or_instance: QuerySet[M] | M) -> None:
         if isinstance(qs_or_instance, QuerySet):
@@ -127,16 +136,20 @@ class Stager(Generic[M]):
         else:
             self.to_delete.add(str(qs_or_instance.pk))
 
-    def commit(self) -> None:
+    def commit(self, exclude: set[str] = set()) -> tuple[set[str], set[str], set[str]]:
         model_name = str(self.model.__name__)
+
+        # Skip any instances that are listed in `exclude` - They may be
+        # depending on other models through ForeignKey relationships.
+        to_create = set(self.to_create) - exclude
 
         with transaction.atomic():
 
-            if any([self.to_create, self.to_delete, self.to_update]):
+            if any([to_create, self.to_delete, self.to_update]):
                 logging.info(f'Committing staged {model_name} instances.')
 
-            if self.to_create:
-                self.model.objects.bulk_create(list(self.to_create.values()))
+            if to_create:
+                self.model.objects.bulk_create([self.to_create[key] for key in to_create])
                 logging.info(f'Created {len(self.to_create):8,} {model_name} instances.')
 
             if self.to_update:
@@ -148,7 +161,14 @@ class Stager(Generic[M]):
                 self.model.objects.filter(id__in=self.to_delete).delete()
                 logging.info(f'Deleted {len(self.to_delete):8,} {model_name} instances.')
 
-            self.reset()
+            created = set(to_create)
+            updated = set(self.to_update)
+            deleted = self.to_delete
+
+            # Exclude instances that were skipped
+            self.reset(exclude=exclude)
+
+        return created, updated, deleted
 
     def get(self, key: str):
         return self.existing.get(key)
@@ -238,7 +258,7 @@ class SuperStager:
 
         # Collect all ManyToManyField through-tables and create `MTMStager`
         # instances for through-table models
-        for stager_key, stager in self.stagers.items():
+        for stager in self.stagers.values():
             for field in self._get_mtm_fields(stager.model):
                 self._create_stager_mtm(field)
 
@@ -278,17 +298,36 @@ class SuperStager:
         return mtm_fields
 
     def commit(self) -> None:
-        from rich import print
-        breakpoint()
 
+        all_created = set()
+        all_to_create = set()
         for stager in self.stagers.values():
-            print(stager.model, stager.to_create)
-            for model in stager.to_create.values():
-                print(model.__dict__)
-            stager.commit()
+            all_to_create.add(*stager.to_create.keys())
+
+        while all_to_create:
+
+            for stager in self.stagers.values():
+
+                # Update stager dependencies
+                defunct_dependees = set()
+                for dependee, dependencies in stager.depends_on.items():
+                    stager.depends_on[dependee] = {dep for dep in dependencies if not dep in all_created}
+                    if not stager.depends_on[dependee]:
+                        defunct_dependees.add(dependee)
+                stager.depends_on = {
+                    dependee: dependencies
+                    for dependee, dependencies in stager.depends_on.items()
+                    if not dependee in defunct_dependees
+                }
+
+                # Exclude all items which depend on models that have yet to be created
+                exclude = {key for key in stager.depends_on if key in all_to_create}
+
+                created, _, _ = stager.commit(exclude=exclude)
+
+                # Remove newly created items from `all_to_create` 
+                all_to_create = {key for key in all_to_create if not key in created}
+                all_created |= created
 
         for stager in self.stagers_mtm.values():
-            print(stager.model, stager.to_create)
-            for model in stager.to_create.values():
-                print(model.__dict__)
             stager.commit()
