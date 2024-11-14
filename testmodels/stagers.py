@@ -10,8 +10,8 @@ class FooStager(SuperStager):
 def test_foo_stager():
     fs = FooStager()
 
-    foo = Foo()
-    bar = Bar()
+    foo = Foo(name="foo_1", value="foo_1")
+    bar = Bar(name="bar_1", value="bar_1")
 
     # fs.create_mtm(foo, bar, field="normal_bars")
 
@@ -21,3 +21,5 @@ def test_foo_stager():
     # should include the `add()` function, which will stage an MTM link between
     # `foo` and `bar`, for instance.
     fs.foo.normal_bars.add(foo, bar)
+
+    fs.commit()

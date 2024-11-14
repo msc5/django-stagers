@@ -1,6 +1,6 @@
 from collections import defaultdict
 import logging
-from typing import Any, Generic, TypeVar
+from typing import Any, Callable, Generic, TypeVar
 
 from django.db import models
 from django.db.models import Model, QuerySet
@@ -24,6 +24,8 @@ class Stager(Generic[M]):
     to_delete: set[str]
 
     to_update_fields: set[str]
+
+    add: "Callable | None"
 
     def __init__(
         self,
@@ -146,44 +148,96 @@ class Stager(Generic[M]):
 
 
 class MTMStager(Stager):
+    from_stager: Stager
+    to_stager: Stager
 
-    # def __init__(self, *args, **kwargs) -> None:
-    #     super().__init__(*args, **kwargs)
+    def _get_through_field(self, model: Model):
+        model_class = model._meta.model
+        for field in self.model._meta.get_fields():
+            rel = getattr(field, "remote_field", None)
+            if rel and rel.model == model_class:
+                return field
+        raise Exception(f"No MTM accessor found on model {model}")
 
-    def add(self): 
-        pass
+    def add(self, from_qs_or_instance: QuerySet | Model, to_qs_or_instance: QuerySet | Model): 
+        if isinstance(from_qs_or_instance, QuerySet):
+            for from_instance in from_qs_or_instance:
+                self.add(from_instance, to_qs_or_instance)
+
+        else:
+            from_instance = from_qs_or_instance
+
+            if isinstance(to_qs_or_instance, QuerySet):
+                for to_instance in to_qs_or_instance:
+                    self.add(from_instance, to_instance)
+
+            else:
+                to_instance = to_qs_or_instance
+
+                through = self.model()
+                setattr(through, self._get_through_field(from_instance).name, from_instance)
+                setattr(through, self._get_through_field(to_instance).name, to_instance)
+                self.create(through)
+
+                # At some point, if we're creating mtm relations between models
+                # we need to make sure they are staged for their individual
+                # stagers as well
 
 
 class SuperStager:
     stagers: dict[str, Stager[Model]] 
-    stagers_mtm: dict[str, dict[str, Stager[Model]]]
+    stagers_mtm: dict[str, MTMStager]
+    stagers_mtm_by_model: dict[str, dict[str, MTMStager]]
 
     def __init__(self, *args, **kwargs):
         self.stagers = {}
-        self.stagers_mtm = defaultdict(dict)
+        self.stagers_mtm ={}
+        self.stagers_mtm_by_model = defaultdict(dict)
+        self.stagers_by_relation = []
 
         # Collect all Stagers defined on subclass
         for key in dir(self):
             if isinstance(stager := getattr(self, key), Stager):
                 self.stagers[key] = stager
 
-                # Collect all ManyToMany through-tables
-                stager_model = self.stagers[key].model
-                for field in stager_model._meta.get_fields():
-                    
-                    if isinstance(field, models.ManyToManyField):
-                        through = field.remote_field.through
-                        if through:
-                            stager_mtm = Stager(queryset=through.objects.all())
+        for stager_key, stager in self.stagers.items():
 
-                            # Create dictionaries to access correct stager for
-                            # ManyToMany field
-                            for model in [field.model, field.remote_field.model]:
-                                for name in [field.name, field.remote_field.name]:
-                                    self.stagers_mtm[model.__name__][name] = stager_mtm
+            # Collect all ManyToMany through-tables
+            model = stager.model
+            for field in model._meta.get_fields():
+                
+                if isinstance(field, models.ManyToManyField):
+                    through = field.remote_field.through
+                    if through:
+                        stager_mtm = MTMStager(queryset=through.objects.all())
 
-    def create_mtm_many(self, from_qs_or_instance: QuerySet | Model, to_qs_or_instance: QuerySet | Model, field: str):
-        pass
+                        through_model_name = through._meta.model.__name__
 
-    def create_mtm(self, from_instance: Model, to_instance: Model, field: str):
-        stager = self.stagers_mtm[from_instance._meta.model.__name__][field]
+                        from_model_name = model.__name__
+                        from_field_name = field.name
+
+                        to_field_name = field.remote_field.name
+                        to_model_name = field.remote_field.model.__name__
+
+                        self.stagers_mtm[through_model_name] = stager_mtm
+                        self.stagers_mtm_by_model[from_model_name][from_field_name] = stager_mtm
+                        self.stagers_mtm_by_model[to_model_name][to_field_name] = stager_mtm
+
+                        self.stagers_by_relation.append((stager_mtm, from_model_name))
+                        self.stagers_by_relation.append((stager_mtm, to_model_name))
+
+
+        for stager in self.stagers.values():
+            for accessor, stager_mtm in self.stagers_mtm_by_model[stager.model.__name__].items():
+                setattr(stager, accessor, stager_mtm)
+
+        # for stager_mtm in self.stagers_mtm.values():
+        #     setattr(stager_mtm, "from_stager", stager)
+
+    def commit(self) -> None:
+
+        for stager in self.stagers.values():
+            stager.commit()
+
+        for stager in self.stagers_mtm.values():
+            stager.commit()
