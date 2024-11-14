@@ -3,8 +3,8 @@ import logging
 from typing import Any, Callable, Generic, TypeVar
 
 from django.db import models
-from django.db.models import Model, QuerySet
 from django.db import transaction
+from django.db.models import Model, QuerySet
 
 
 M = TypeVar('M', bound=Model)
@@ -12,12 +12,13 @@ M = TypeVar('M', bound=Model)
 
 class Stager(Generic[M]):
     model: type[M]
+    model_name: str
 
     existing: dict[str, M]
+    existing_related: dict[str, dict[str, QuerySet]]
+
     seen: set[str]
     key: str
-
-    existing_related: dict[str, dict[str, QuerySet]]
 
     to_create: dict[str, M]
     to_update: dict[str, M]
@@ -42,8 +43,11 @@ class Stager(Generic[M]):
 
         assert self.queryset.model
         self.model = self.queryset.model
+        self.model_name = str(self.model.__name__)
         self.key = key
         self.load_related = load_related
+
+        self.depends_on = defaultdict(set)
 
         self.existing = {getattr(m, self.key): m for m in self.queryset}
         self.existing_related = defaultdict(dict)
@@ -59,7 +63,6 @@ class Stager(Generic[M]):
             for key, val in getattr(self, "to_create", {}).items()
             if key in exclude
         } 
-        self.depends_on = getattr(self, "depends_on", defaultdict(set))
 
         self.to_update = {}
         self.to_update_fields = set()
@@ -69,7 +72,7 @@ class Stager(Generic[M]):
     def reset_seen(self):
         self.seen = set()
 
-    def _check_dependencies(self, instance: Model):
+    def _track_dependencies(self, instance: Model):
         key = str(getattr(instance, self.key, ""))
         for field in instance._meta.get_fields():
             if isinstance(field, models.ForeignKey):
@@ -83,13 +86,13 @@ class Stager(Generic[M]):
             assert isinstance(instance := qs_or_instance, self.model)
             key = str(getattr(instance, self.key, ""))
 
-            # Use most recent `qs_or_instance` associated with `key`,
-            # potentially overwriting previous version that existed from a
-            # different `create()` call.
+            if key in self.to_create:
+                raise Exception((f"The {self.model_name} instance with key {key} "
+                                 f"is already staged for creation"))
+
             self.to_create[key] = instance
-            self.existing[key] = instance
             self.seen.add(key)
-            self._check_dependencies(instance)
+            self._track_dependencies(instance)
 
     def update(self, qs_or_instance: QuerySet[M] | M, field: str, value: Any) -> None:
         if isinstance(qs_or_instance, QuerySet):
@@ -127,7 +130,7 @@ class Stager(Generic[M]):
                 self.create(instance)
 
             self.seen.add(key)
-            self._check_dependencies(instance)
+            self._track_dependencies(instance)
 
     def delete(self, qs_or_instance: QuerySet[M] | M) -> None:
         if isinstance(qs_or_instance, QuerySet):
@@ -137,7 +140,6 @@ class Stager(Generic[M]):
             self.to_delete.add(str(qs_or_instance.pk))
 
     def commit(self, exclude: set[str] = set()) -> tuple[set[str], set[str], set[str]]:
-        model_name = str(self.model.__name__)
 
         # Skip any instances that are listed in `exclude` - They may be
         # depending on other models through ForeignKey relationships.
@@ -146,24 +148,27 @@ class Stager(Generic[M]):
         with transaction.atomic():
 
             if any([to_create, self.to_delete, self.to_update]):
-                logging.info(f'Committing staged {model_name} instances.')
+                logging.info(f'Committing staged {self.model_name} instances.')
 
             if to_create:
                 self.model.objects.bulk_create([self.to_create[key] for key in to_create])
-                logging.info(f'Created {len(self.to_create):8,} {model_name} instances.')
+                logging.info(f'Created {len(self.to_create):8,} {self.model_name} instances.')
 
             if self.to_update:
                 self.model.objects.bulk_update(list(self.to_update.values()), fields=list(self.to_update_fields))
-                logging.info(f'Updated {len(self.to_update):8,} {model_name} instances.')
+                logging.info(f'Updated {len(self.to_update):8,} {self.model_name} instances.')
                 logging.info(f'Updated Fields: {self.to_update_fields}')
 
             if self.to_delete:
                 self.model.objects.filter(id__in=self.to_delete).delete()
-                logging.info(f'Deleted {len(self.to_delete):8,} {model_name} instances.')
+                logging.info(f'Deleted {len(self.to_delete):8,} {self.model_name} instances.')
 
             created = set(to_create)
             updated = set(self.to_update)
             deleted = self.to_delete
+
+            for key in created:
+                self.existing[key] = self.to_create[key]
 
             # Exclude instances that were skipped
             self.reset(exclude=exclude)
@@ -172,6 +177,9 @@ class Stager(Generic[M]):
 
     def get(self, key: str):
         return self.existing.get(key)
+
+    def get_key(self, instance: M):
+        return str(getattr(instance, self.key))
 
     def has(self, instance: M):
         key = getattr(instance, self.key)
@@ -221,7 +229,8 @@ class MTMStager(Stager):
 
         for instance in [from_instance, to_instance]:
             model_stager = self._get_model_stager(instance)
-            if not model_stager.has(instance):
+
+            if model_stager.get_key(instance) not in model_stager.to_create:
                 model_stager.create(instance)
 
             through_field = self._get_through_field(instance)
@@ -239,7 +248,8 @@ class MTMStager(Stager):
                 for to_instance in to_qs_or_instance:
                     self.add(from_instance, to_instance)
             else:
-                self._add(from_instance, to_qs_or_instance)
+                to_instance = to_qs_or_instance
+                self._add(from_instance, to_instance)
 
 
 class SuperStager:
@@ -297,32 +307,50 @@ class SuperStager:
 
         return mtm_fields
 
+    def _update_stager_dependencies(self, stager: Stager, all_created: set[str]):
+
+        defunct_dependees = set()
+        for dependee, dependencies in stager.depends_on.items():
+            stager.depends_on[dependee] = {dep for dep in dependencies if not dep in all_created}
+            if not stager.depends_on[dependee]:
+                defunct_dependees.add(dependee)
+
+        stager.depends_on = {
+            dependee: dependencies
+            for dependee, dependencies in stager.depends_on.items()
+            if not dependee in defunct_dependees
+        }
+
+    @property
+    def existing(self):
+        existing = set()
+        for stager in self.stagers.values():
+            existing |= set(stager.existing)
+        return existing
+
     def commit(self) -> None:
 
         all_created = set()
         all_to_create = set()
         for stager in self.stagers.values():
-            all_to_create.add(*stager.to_create.keys())
+            all_to_create |= set(stager.to_create.keys())
 
         while all_to_create:
 
             for stager in self.stagers.values():
 
-                # Update stager dependencies
-                defunct_dependees = set()
-                for dependee, dependencies in stager.depends_on.items():
-                    stager.depends_on[dependee] = {dep for dep in dependencies if not dep in all_created}
-                    if not stager.depends_on[dependee]:
-                        defunct_dependees.add(dependee)
-                stager.depends_on = {
-                    dependee: dependencies
-                    for dependee, dependencies in stager.depends_on.items()
-                    if not dependee in defunct_dependees
-                }
+                # TODO: Needs to check if key in "all_existing" rather than
+                # "all_to_create" or "all_created" because key may have already
+                # been created in database.
+
+                # TODO: Need to support update() that has changed to new
+                # dependency
 
                 # Exclude all items which depend on models that have yet to be created
+                self._update_stager_dependencies(stager, all_created)
                 exclude = {key for key in stager.depends_on if key in all_to_create}
 
+                # Create models that don't have non-existing dependencies
                 created, _, _ = stager.commit(exclude=exclude)
 
                 # Remove newly created items from `all_to_create` 
