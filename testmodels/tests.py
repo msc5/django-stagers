@@ -2,23 +2,26 @@ import uuid
 
 from django.utils import timezone
 import pytest
+from faker import Faker
 
 from src import django_stagers as stagers
 from testmodels.models import Bar, Foo
 
+Faker.seed(str(uuid.uuid4()))
+fake = Faker()
 
 def create_foo():
     return Foo(
-        name=str(uuid.uuid4()),
-        value=str(uuid.uuid4()),
+        name=fake.name(),
+        value=fake.text(),
         datetime_action=timezone.now()
     )
 
 def create_bar(foo: Foo):
     return Bar(
         foo=foo,
-        name=str(uuid.uuid4()),
-        value=str(uuid.uuid4()),
+        name=fake.name(),
+        value=fake.text(),
         datetime_action=timezone.now()
     )
 
@@ -110,3 +113,21 @@ def test_foo_bar_multi_and_mtm_creation(foo_bar_stager, bar: Bar):
     new_bar = Bar.objects.get(id=bar.id)
     assert new_foo.normal_bars.contains(new_bar)
     assert new_bar.foo.id == new_foo.id
+
+
+@pytest.mark.django_db
+def test_foo_bar_many_creation(foo_bar_stager):
+
+    n = 100
+
+    for _ in range(n):
+        foo = create_foo()
+        bar = create_bar(foo)
+        foo_bar_stager.bar.create(bar)
+        foo_bar_stager.foo.create(bar.foo)
+        foo_bar_stager.foo.normal_bars.add(bar.foo, bar)
+
+    foo_bar_stager.commit()
+
+    assert Foo.objects.count() == n
+    assert Bar.objects.count() == n

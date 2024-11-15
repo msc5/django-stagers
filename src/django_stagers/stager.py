@@ -1,10 +1,12 @@
 from collections import defaultdict
 import logging
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Callable, Generic, Hashable, TypeVar
 
 from django.db import models
 from django.db import transaction
 from django.db.models import Model, QuerySet
+
+from .fields import _get_mtm_fields, _get_mtm_unique_key
 
 
 M = TypeVar('M', bound=Model)
@@ -14,25 +16,26 @@ class Stager(Generic[M]):
     model: type[M]
     model_name: str
 
-    existing: dict[str, M]
-    existing_related: dict[str, dict[str, QuerySet]]
+    existing: dict[Hashable, M]
+    existing_related: dict[Hashable, dict[Hashable, QuerySet]]
 
-    seen: set[str]
-    key: str
+    seen: set[Hashable]
+    key: str | Callable[[M], Hashable]
 
-    to_create: dict[str, M]
-    to_update: dict[str, M]
-    to_delete: set[str]
+    to_create: dict[Hashable, M]
+    to_update: dict[Hashable, M]
+    to_delete: set[Hashable]
 
-    to_update_fields: set[str]
+    to_update_fields: set[Hashable]
 
     add: "Callable | None"
-    depends_on: dict[str, set[str]]
+    super_stager: "SuperStager | None"
+    depends_on: dict[Hashable, set[Hashable]]
 
     def __init__(
         self,
         queryset: QuerySet[M] | Callable[[], QuerySet[M]],
-        key: str = 'pk',
+        key: str | Callable[[M], Hashable] = 'pk',
         load_related: list[str] = []
     ) -> None:
 
@@ -46,10 +49,9 @@ class Stager(Generic[M]):
         self.model_name = str(self.model.__name__)
         self.key = key
         self.load_related = load_related
-
         self.depends_on = defaultdict(set)
 
-        self.existing = {getattr(m, self.key): m for m in self.queryset}
+        self.existing = {self.get_key(m): m for m in self.queryset}
         self.existing_related = defaultdict(dict)
         for key in self.load_related:
             for existing_key, existing_model in self.existing.items():
@@ -57,12 +59,12 @@ class Stager(Generic[M]):
 
         self.reset()
 
-    def reset(self, exclude: set[str] = set()):
+    def reset(self, exclude: set[Hashable] = set()):
         self.to_create = {
             key: val
             for key, val in getattr(self, "to_create", {}).items()
             if key in exclude
-        } 
+        }
 
         self.to_update = {}
         self.to_update_fields = set()
@@ -72,11 +74,19 @@ class Stager(Generic[M]):
     def reset_seen(self):
         self.seen = set()
 
-    def _track_dependencies(self, instance: Model):
-        key = str(getattr(instance, self.key, ""))
+    def _track_dependencies(self, instance: M):
+        key = self.get_key(instance)
         for field in instance._meta.get_fields():
             if isinstance(field, models.ForeignKey):
-                self.depends_on[key].add(str(getattr(instance, field.name).pk))
+
+                remote_instance = getattr(instance, field.name)
+                if self.super_stager:
+                    self.depends_on[key].add(self.super_stager.get_key_for_instance(remote_instance))
+                else:
+                    self.depends_on[key].add(str(remote_instance.pk))
+
+    def log(self, message: str):
+        logging.debug(f"[ ({self.model_name}) Stager ] {message}")
 
     def create(self, qs_or_instance: QuerySet[M] | M) -> None:
         if isinstance(qs_or_instance, QuerySet):
@@ -84,11 +94,17 @@ class Stager(Generic[M]):
                 self.create(instance)
         else:
             assert isinstance(instance := qs_or_instance, self.model)
-            key = str(getattr(instance, self.key, ""))
+            key = self.get_key(instance)
 
-            if key in self.to_create:
+            if key in self.to_delete:
                 raise Exception((f"The {self.model_name} instance with key {key} "
-                                 f"is already staged for creation"))
+                                 f" is already staged for deletion."))
+            if key in self.existing:
+                raise Exception((f"The {self.model_name} instance with key {key} "
+                                 f"already exists in the database."))
+
+            # If a new model with the same `key` in `self.to_create` is staged
+            # for creation, it will replace the existing instance.
 
             self.to_create[key] = instance
             self.seen.add(key)
@@ -100,10 +116,11 @@ class Stager(Generic[M]):
                 self.update(instance, field, value)
         else:
             assert isinstance(instance := qs_or_instance, self.model)
-            key = str(getattr(instance, self.key, ""))
+            key = self.get_key(instance)
 
             if key in self.to_delete:
-                raise Exception(f"The model model with key {key} is already staged for deletion.")
+                raise Exception((f"The {self.model_name} instance with key {key} "
+                                 f" is already staged for deletion."))
 
             # If the model is already staged to be created or updated, we don't
             # need to also stage it for update, since the value will change
@@ -137,31 +154,40 @@ class Stager(Generic[M]):
             for instance in qs_or_instance:
                 self.delete(instance)
         else:
-            self.to_delete.add(str(qs_or_instance.pk))
+            assert isinstance(instance := qs_or_instance, self.model)
+            key = self.get_key(instance)
 
-    def commit(self, exclude: set[str] = set()) -> tuple[set[str], set[str], set[str]]:
+            if key in self.to_create:
+                raise Exception((f"The {self.model_name} instance with key {key} "
+                                 f"is already staged for creation."))
+            if key in self.to_update:
+                raise Exception((f"The {self.model_name} instance with key {key} "
+                                 f"is already staged for update."))
+
+            self.to_delete.add(self.get_key(instance))
+
+    def commit(self, exclude: set[Hashable] = set()) -> tuple[set[Hashable], set[Hashable], set[Hashable]]:
 
         # Skip any instances that are listed in `exclude` - They may be
         # depending on other models through ForeignKey relationships.
         to_create = set(self.to_create) - exclude
 
         with transaction.atomic():
-
-            if any([to_create, self.to_delete, self.to_update]):
-                logging.info(f'Committing staged {self.model_name} instances.')
+            self.log(f"Depends on {len(self.depends_on)} model instances.")
 
             if to_create:
                 self.model.objects.bulk_create([self.to_create[key] for key in to_create])
-                logging.info(f'Created {len(self.to_create):8,} {self.model_name} instances.')
+                self.log(f'Created {len(self.to_create)} {self.model_name} instances.')
 
             if self.to_update:
-                self.model.objects.bulk_update(list(self.to_update.values()), fields=list(self.to_update_fields))
-                logging.info(f'Updated {len(self.to_update):8,} {self.model_name} instances.')
-                logging.info(f'Updated Fields: {self.to_update_fields}')
+                to_update_fields = list([str(f) for f in self.to_update_fields])
+                self.model.objects.bulk_update(list(self.to_update.values()), fields=to_update_fields)
+                self.log(f'Updated {len(self.to_update)} {self.model_name} instances.')
+                self.log(f'Updated Fields: {self.to_update_fields}')
 
             if self.to_delete:
                 self.model.objects.filter(id__in=self.to_delete).delete()
-                logging.info(f'Deleted {len(self.to_delete):8,} {self.model_name} instances.')
+                self.log(f'Deleted {len(self.to_delete)} {self.model_name} instances.')
 
             created = set(to_create)
             updated = set(self.to_update)
@@ -178,12 +204,11 @@ class Stager(Generic[M]):
     def get(self, key: str):
         return self.existing.get(key)
 
-    def get_key(self, instance: M):
-        return str(getattr(instance, self.key))
-
-    def has(self, instance: M):
-        key = getattr(instance, self.key)
-        return key in self.existing
+    def get_key(self, instance: M) -> Hashable:
+        if isinstance(self.key, str):
+            return str(getattr(instance, self.key))
+        else:
+            return self.key(instance)
 
     @property
     def unseen_instances(self) -> list[M]:
@@ -197,7 +222,7 @@ class MTMStager(Stager):
     model_stagers: list[Stager]
 
     def __init__(self, model_stagers: list[Stager] | None, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs, key=_get_mtm_unique_key)
         if model_stagers:
             self.model_stagers = model_stagers
 
@@ -230,15 +255,18 @@ class MTMStager(Stager):
         for instance in [from_instance, to_instance]:
             model_stager = self._get_model_stager(instance)
 
-            if model_stager.get_key(instance) not in model_stager.to_create:
+            key = model_stager.get_key(instance)
+            if key not in model_stager.existing:
                 model_stager.create(instance)
 
             through_field = self._get_through_field(instance)
             setattr(through, through_field.name, instance)
 
-        self.create(through)
+        key = self.get_key(through)
+        if not key in self.existing:
+            self.create(through)
 
-    def add(self, from_qs_or_instance: QuerySet | Model, to_qs_or_instance: QuerySet | Model): 
+    def add(self, from_qs_or_instance: QuerySet | Model, to_qs_or_instance: QuerySet | Model):
         if isinstance(from_qs_or_instance, QuerySet):
             for from_instance in from_qs_or_instance:
                 self.add(from_instance, to_qs_or_instance)
@@ -253,24 +281,32 @@ class MTMStager(Stager):
 
 
 class SuperStager:
-    stagers: dict[str, Stager[Model]] 
+    stagers: dict[str, Stager[Model]]
     stagers_mtm: dict[str, MTMStager]
 
     def __init__(self, *args, **kwargs):
         self.stagers = {}
-        self.stagers_mtm ={}
+        self.stagers_mtm = {}
 
         # Collect all `Stager` instances defined on subclass and cache them by
         # model name
         for key in dir(self):
             if isinstance(stager := getattr(self, key), Stager):
                 self.stagers[stager.model.__name__] = stager
+                stager.super_stager = self
 
         # Collect all ManyToManyField through-tables and create `MTMStager`
         # instances for through-table models
         for stager in self.stagers.values():
-            for field in self._get_mtm_fields(stager.model):
+            for field in _get_mtm_fields(stager.model):
                 self._create_stager_mtm(field)
+
+    def _get_stager_for_model(self, model: Model):
+        return self.stagers[model._meta.model.__name__]
+
+    def get_key_for_instance(self, model: Model):
+        stager = self._get_stager_for_model(model)
+        return stager.get_key(model)
 
     def _create_stager_mtm(self, field: models.ManyToManyField):
         assert (through := field.remote_field.through)
@@ -284,6 +320,7 @@ class SuperStager:
                 self.stagers[field.remote_field.model.__name__],
             ]
         )
+        stager_mtm.super_stager = self
 
         # Cache `MTMStager` instance by through-table model name
         self.stagers_mtm[through._meta.model.__name__] = stager_mtm
@@ -296,22 +333,11 @@ class SuperStager:
             elif field.remote_field.model == stager.model:
                 setattr(stager, field.remote_field.name, stager_mtm)
 
-    def _get_mtm_fields(self, model: type[Model]):
-        mtm_fields = []
-
-        for field in model._meta.get_fields():
-            if isinstance(field, models.ManyToManyField):
-                through = field.remote_field.through
-                if through:
-                    mtm_fields.append(field)
-
-        return mtm_fields
-
-    def _update_stager_dependencies(self, stager: Stager, all_created: set[str]):
+    def _update_stager_dependencies(self, stager: Stager, all_existing: set[str]):
 
         defunct_dependees = set()
         for dependee, dependencies in stager.depends_on.items():
-            stager.depends_on[dependee] = {dep for dep in dependencies if not dep in all_created}
+            stager.depends_on[dependee] = {dep for dep in dependencies if dep not in all_existing}
             if not stager.depends_on[dependee]:
                 defunct_dependees.add(dependee)
 
@@ -321,41 +347,54 @@ class SuperStager:
             if not dependee in defunct_dependees
         }
 
-    @property
-    def existing(self):
-        existing = set()
-        for stager in self.stagers.values():
-            existing |= set(stager.existing)
-        return existing
+    def log(self, message: str):
+        logging.debug(f"[ {self.__class__.__name__} ] {message}")
 
-    def commit(self) -> None:
+    def commit(self) -> tuple[set[Hashable], set[Hashable], set[Hashable]]:
 
         all_created = set()
+        all_updated = set()
+        all_deleted = set()
+
         all_to_create = set()
+        all_existing = set()
+        all_dependees = defaultdict(set)
+
         for stager in self.stagers.values():
-            all_to_create |= set(stager.to_create.keys())
+            all_to_create |= set(stager.to_create)
+            all_existing |= set(stager.get_key(m) for m in stager.existing.values())
+
+            for depender, dependees in stager.depends_on.items():
+                for dependee in dependees:
+                    all_dependees[dependee].add(depender)
 
         while all_to_create:
+            self.log(f"Creating {len(all_to_create)} model instances")
 
             for stager in self.stagers.values():
 
-                # TODO: Needs to check if key in "all_existing" rather than
-                # "all_to_create" or "all_created" because key may have already
-                # been created in database.
+                # TODO: Need to support the case where update() changes an
+                # existing instance to a new dependency which may not yet exist
 
-                # TODO: Need to support update() that has changed to new
-                # dependency
+                stager.depends_on = {
+                    depender: dependees - all_existing
+                    for depender, dependees in stager.depends_on.items()
+                    if (depender not in all_existing
+                        and not dependees.issubset(all_existing))
+                }
 
-                # Exclude all items which depend on models that have yet to be created
-                self._update_stager_dependencies(stager, all_created)
-                exclude = {key for key in stager.depends_on if key in all_to_create}
+                # Create models that don't have dependencies
+                created, updated, deleted = stager.commit(exclude=set(stager.depends_on))
 
-                # Create models that don't have non-existing dependencies
-                created, _, _ = stager.commit(exclude=exclude)
+                # Remove newly created items from `all_to_create`
+                all_to_create -= created
+                all_existing |= created
 
-                # Remove newly created items from `all_to_create` 
-                all_to_create = {key for key in all_to_create if not key in created}
                 all_created |= created
+                all_updated |= updated
+                all_deleted |= deleted
 
         for stager in self.stagers_mtm.values():
             stager.commit()
+
+        return all_created, all_updated, all_deleted
