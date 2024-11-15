@@ -1,6 +1,6 @@
 [project]
 name = "django-stagers"
-version = "0.0.9"
+version = "0.0.10"
 authors = [
   { name="Matthew Coleman", email="19colemanm@gmail.com" },
 ]
