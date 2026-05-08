@@ -116,6 +116,20 @@ def test_foo_bar_multi_and_mtm_creation(foo_bar_stager, bar: Bar):
 
 
 @pytest.mark.django_db
+def test_deduping_mtm_creation(foo_bar_stager, bar: Bar):
+    foo_bar_stager.bar.create(bar)
+    foo_bar_stager.foo.create(bar.foo)
+    foo_bar_stager.foo.normal_bars.add(bar.foo, bar)
+    foo_bar_stager.bar.normal_foos.add(bar.foo, bar)
+    foo_bar_stager.commit()
+
+    new_foo = Foo.objects.get(id=bar.foo.id)
+    new_bar = Bar.objects.get(id=bar.id)
+    assert new_foo.normal_bars.contains(new_bar)
+    assert new_bar.foo.id == new_foo.id
+
+
+@pytest.mark.django_db
 def test_foo_bar_many_creation(foo_bar_stager):
 
     n = 100
